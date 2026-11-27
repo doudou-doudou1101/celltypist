@@ -126,7 +126,8 @@ def hier_annotate(filename: Union[AnnData, str] = "",
                   use_GPU: bool = False,
                   min_prop: float = 0.0,
                   compute_conf: bool = True,
-                  label_source: str = 'predicted_labels') -> classifier.HierAnnotationResult:
+                  label_source: str = 'predicted_labels',
+                  all_probs: bool = False) -> classifier.HierAnnotationResult:
     """
     Run hierarchical celltyping and (optional) majority voting to annotate the input dataset.
 
@@ -174,6 +175,9 @@ def hier_annotate(filename: Union[AnnData, str] = "",
     label_source
         The attribute from which to retrieve cell type labels for confidence scoring. Must be one of `'predicted_labels'` or `'majority_voting'`.
         (Default: `'predicted_labels'`)
+    all_probs
+        Whether to predict probabilities for all LCPN nodes on all query cells.
+        (Default: ``False``)
 
     Returns
     ----------
@@ -187,6 +191,7 @@ def hier_annotate(filename: Union[AnnData, str] = "",
         6) :attr:`~celltypist.classifier.HierAnnotationResult.conf_score`, confidence scores at each level.
         7) :attr:`~celltypist.classifier.HierAnnotationResult.adata`, AnnData representation of the input data.
         8) :attr:`~celltypist.classifier.HierAnnotationResult.tree`, Tree representation of the input cell type hierarchy.
+        9) :attr:`~celltypist.classifier.HierAnnotationResult.full_prob_matrix`, optional full probability matrices for LCPN results when ``all_probs=True``.
     """
     #load model
     if isinstance(model, Model):
@@ -196,7 +201,10 @@ def hier_annotate(filename: Union[AnnData, str] = "",
     #construct HierClassifier class
     clf = classifier.HierClassifier(filename = filename, model = hi_classifier, transpose = transpose_input, gene_file = gene_file, cell_file = cell_file)
     #predict
-    hier_predictions = clf.celltype(reshape_lcpn = True)
+    hier_predictions = clf.celltype(
+        reshape_lcpn=True,
+        all_probs=all_probs,
+    )
     #majority_voting
     if majority_voting:
         if hier_predictions.cell_count <= 50:

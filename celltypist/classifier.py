@@ -400,6 +400,8 @@ class HierAnnotationResult():
     probability_matrix
         A dictionary of probability matrices representing the probability each cell belongs to a given cell type at each level.
         In LCPN results, a cell's unconsidered branches (i.e., cell types outside its traversed branch) are represented as NaN.
+    full_prob_matrix
+        Optional dictionary of per-level probability matrices. Present for LCPN results when ``all_probs=True``. Contains probabilities for all valid labels across all query cells.
     conf_score
         A :class:`~pandas.DataFrame` object of confidence scores at each level. Only present when confidence scores are calculated.
         In LCPN results, cells may have NaN confidence scores when their majority-voted cell type labels lie outside their traversed branches.
@@ -718,8 +720,8 @@ class HierAnnotationResult():
         if self.mode != 'LCL':
             raise ValueError('🛑 This method is only applicable to LCL predictions')
 
-        if over_clustering is None and hasattr(self, 'over_clustering'):
-            over_clustering = self.over_clustering
+        if over_clustering is None:
+            over_clustering = getattr(self, 'over_clustering', None)
 
         logger.info('🛠️ Refining LCL predictions...')
 
@@ -727,201 +729,136 @@ class HierAnnotationResult():
         cells = self.predicted_labels.index
         max_depth = tree.depth
         root_name = tree.root.original_name
-
-        if cells.has_duplicates:
-            raise ValueError('🛑 Cell identifiers must be unique')
-
         leaves = [
             node.original_name
-            for node in tree.iter_nodes(leaf_only = True)
+            for node in tree.iter_nodes(leaf_only=True)
             if node.size > 0
         ]
-        if not leaves:
-            raise ValueError('🛑 The tree has no non-zero-size leaf labels')
 
-        level_labels = {depth: [] for depth in range(1, max_depth + 1)}
-        level_paths = {depth: {} for depth in range(1, max_depth + 1)}
-
-        for leaf in leaves:
-            path = [
-                node.original_name
-                for node in tree.extract_path(leaf, print_path = False)
-            ]
-            path += [leaf] * (max_depth - len(path))
-
-            if len(path) != max_depth:
-                raise ValueError(f"🛑 Invalid path length for leaf '{leaf}'")
-
-            for depth, label in enumerate(path, start = 1):
-                path_at_depth = tuple(path[:depth])
-                if label not in level_paths[depth]:
-                    level_labels[depth].append(label)
-                    level_paths[depth][label] = path_at_depth
-                elif level_paths[depth][label] != path_at_depth:
-                    raise ValueError(
-                            f"🛑 Label '{label}' maps to multiple paths at level {depth}")
-
-        if level_labels[1] != [root_name]:
-            raise ValueError('🛑 The tree must have a single root label')
-
-        level_probs = {1: {root_name: np.ones(len(cells), dtype = float)}}
-
-        for depth in range(2, max_depth + 1):
-            level_key = f'level{depth}'
-            labels = level_labels[depth]
-            matrix = self.probability_matrix.get(level_key)
-
-            if matrix is None:
-                if len(labels) != 1:
-                    raise ValueError(f"🛑 Missing probability matrix '{level_key}'")
-                level_probs[depth] = {
-                    labels[0]: np.ones(len(cells), dtype = float)
-                }
-                continue
-
-            if matrix.index.has_duplicates or matrix.columns.has_duplicates:
-                raise ValueError(
-                        f"🛑 Duplicate identifiers found in '{level_key}' probabilities")
-
-            missing_cells = cells.difference(matrix.index)
-            missing_labels = [label for label in labels if label not in matrix.columns]
-            if len(missing_cells) or missing_labels:
-                raise ValueError(
-                        f"🛑 Incomplete '{level_key}' probability matrix: "
-                        f"{len(missing_cells)} missing cells; missing labels {missing_labels}")
-
-            values = matrix.loc[cells, labels].to_numpy(dtype = float)
-            if (
-                not np.all(np.isfinite(values))
-                or np.any(values < -1e-12)
-                or np.any(values > 1 + 1e-12)
-            ):
-                raise ValueError(f"🛑 Invalid probabilities found in '{level_key}'")
-
-            values = np.clip(values, 0.0, 1.0)
-            level_probs[depth] = {
-                label: values[:, idx]
-                for idx, label in enumerate(labels)
+        paths = [
+            [node.original_name for node in tree.extract_path(leaf, print_path=False)]
+            for leaf in leaves
+        ]
+        paths = [
+            path + [leaf] * (max_depth - len(path))
+            for leaf, path in zip(leaves, paths)
+        ]
+        level_labels = {
+            depth: list(dict.fromkeys(path[depth - 1] for path in paths))
+            for depth in range(1, max_depth + 1)
+        }
+        level_paths = {
+            depth: {
+                path[depth - 1]: tuple(path[:depth])
+                for path in paths
             }
-
-        log_scores = {1: {root_name: np.zeros(len(cells), dtype = float)}}
-        score_arrays = {1: level_probs[1]}
-
-        for depth in range(2, max_depth + 1):
-            log_scores[depth] = {}
-            score_arrays[depth] = {}
-
-            for label in level_labels[depth]:
-                parent = level_paths[depth][label][-2]
-                with np.errstate(divide = 'ignore'):
-                    log_scores[depth][label] = (
-                        log_scores[depth - 1][parent]
-                        + np.log(level_probs[depth][label])
-                    )
-                score_arrays[depth][label] = np.exp(log_scores[depth][label])
-
-        refined_probability_matrix = {
-            f'level{depth}': pd.DataFrame(score_arrays[depth], index = cells)
             for depth in range(1, max_depth + 1)
         }
 
-        refined_labels_data = []
-        refined_conf_data = []
+        level_probs = {1: {root_name: np.ones(len(cells), dtype=float)}}
+        for depth in range(2, max_depth + 1):
+            labels = level_labels[depth]
+            matrix = self.probability_matrix.get(f'level{depth}')
+
+            if matrix is None:
+                if len(labels) != 1:
+                    raise ValueError(f"🛑 Missing probability matrix 'level{depth}'")
+                level_probs[depth] = {labels[0]: np.ones(len(cells), dtype=float)}
+            else:
+                values = matrix.loc[cells, labels].to_numpy(dtype=float)
+                level_probs[depth] = dict(zip(labels, values.T))
+
+        log_scores = {1: {root_name: np.zeros(len(cells), dtype=float)}}
+        with np.errstate(divide='ignore'):
+            for depth in range(2, max_depth + 1):
+                log_scores[depth] = {
+                    label: log_scores[depth - 1][level_paths[depth][label][-2]]
+                    + np.log(level_probs[depth][label])
+                    for label in level_labels[depth]
+                }
+
+        level_scores = {
+            depth: np.column_stack([
+                log_scores[depth][label] for label in level_labels[depth]
+            ])
+            for depth in range(1, max_depth + 1)
+        }
+        score_arrays = {
+            depth: np.exp(scores)
+            for depth, scores in level_scores.items()
+        }
+        refined_probability_matrix = {
+            f'level{depth}': pd.DataFrame(
+                score_arrays[depth],
+                index=cells,
+                columns=level_labels[depth]
+            )
+            for depth in range(1, max_depth + 1)
+        }
+
+        labels_by_level = {}
+        conf_by_level = {}
 
         if hierarchy_consistent:
             final_labels = level_labels[max_depth]
-            final_scores = np.column_stack([
-                log_scores[max_depth][label] for label in final_labels
-            ])
+            final_scores = level_scores[max_depth]
+            valid = np.isfinite(final_scores).any(axis=1)
+            best_idx = final_scores.argmax(axis=1)
+            path_matrix = np.asarray(
+                [level_paths[max_depth][label] for label in final_labels],
+                dtype=object
+            )
+            selected_paths = path_matrix[best_idx].copy()
+            selected_paths[~valid] = None
 
-            for cell_idx in range(len(cells)):
-                if not np.isfinite(final_scores[cell_idx]).any():
-                    refined_labels_data.append({
-                        f'level{depth}_refined_labels': None
-                        for depth in range(1, max_depth + 1)
-                    })
-                    refined_conf_data.append({
-                        f'level{depth}_conf_score': 0.0
-                        for depth in range(1, max_depth + 1)
-                    })
-                    continue
-
-                leaf = final_labels[int(np.argmax(final_scores[cell_idx]))]
-                path = level_paths[max_depth][leaf]
-                refined_labels_data.append({
-                    f'level{depth}_refined_labels': label
-                    for depth, label in enumerate(path, start = 1)
-                })
-                refined_conf_data.append({
-                    f'level{depth}_conf_score': score_arrays[depth][label][cell_idx]
-                    for depth, label in enumerate(path, start = 1)
-                })
+            for depth in range(1, max_depth + 1):
+                labels_by_level[f'level{depth}_refined_labels'] = selected_paths[:, depth - 1]
+                label_indices = {
+                    label: idx for idx, label in enumerate(level_labels[depth])
+                }
+                selected_indices = np.array([
+                    label_indices[label]
+                    for label in path_matrix[best_idx[valid], depth - 1]
+                ], dtype=int)
+                confidence = np.zeros(len(cells), dtype=float)
+                rows = np.flatnonzero(valid)
+                confidence[valid] = score_arrays[depth][rows, selected_indices]
+                conf_by_level[f'level{depth}_conf_score'] = confidence
         else:
-            level_scores = {
-                depth: np.column_stack([
-                    log_scores[depth][label] for label in level_labels[depth]
-                ])
-                for depth in range(1, max_depth + 1)
-            }
+            for depth in range(1, max_depth + 1):
+                scores = level_scores[depth]
+                valid = np.isfinite(scores).any(axis=1)
+                best_idx = scores.argmax(axis=1)
+                labels = np.asarray(level_labels[depth], dtype=object)[best_idx]
+                labels[~valid] = None
 
-            for cell_idx in range(len(cells)):
-                labels_row = {}
-                conf_row = {}
+                confidence = score_arrays[depth][np.arange(len(cells)), best_idx]
+                confidence[~valid] = 0.0
+                labels_by_level[f'level{depth}_refined_labels'] = labels
+                conf_by_level[f'level{depth}_conf_score'] = confidence
 
-                for depth in range(1, max_depth + 1):
-                    labels = level_labels[depth]
-                    scores = level_scores[depth][cell_idx]
-
-                    if not np.isfinite(scores).any():
-                        best_label, confidence = None, 0.0
-                    else:
-                        best_label = labels[int(np.argmax(scores))]
-                        confidence = score_arrays[depth][best_label][cell_idx]
-
-                    labels_row[f'level{depth}_refined_labels'] = best_label
-                    conf_row[f'level{depth}_conf_score'] = confidence
-
-                refined_labels_data.append(labels_row)
-                refined_conf_data.append(conf_row)
-
-        refined_labels = pd.DataFrame(
-            refined_labels_data,
-            index = cells,
-            columns = [
-                f'level{depth}_refined_labels'
-                for depth in range(1, max_depth + 1)
-            ]
-        )
-        refined_conf = pd.DataFrame(
-            refined_conf_data,
-            index = cells,
-            columns = [
-                f'level{depth}_conf_score'
-                for depth in range(1, max_depth + 1)
-            ]
-        )
+        refined_labels = pd.DataFrame(labels_by_level, index=cells)
+        refined_conf = pd.DataFrame(conf_by_level, index=cells)
 
         if over_clustering is not None:
-            logger.info("🗳️ Majority voting the refined predictions")
-            majority_voting = pd.DataFrame(index = cells)
-
+            logger.info('🗳️ Majority voting the refined predictions')
+            majority_voting = pd.DataFrame(index=cells)
             for col in refined_labels.columns:
                 mv = _majority_vote(refined_labels[col], over_clustering, min_prop)
-                majority_voting[col.replace('refined_labels', 'majority_voting')] = mv.majority_voting
-
+                majority_voting[
+                    col.replace('refined_labels', 'majority_voting')
+                ] = mv.majority_voting
             self.refined_majority_voting = majority_voting
             self.over_clustering = mv.over_clustering
 
         if scale_score:
             logger.info('⚖️ Scaling refined confidence scores per level')
             for depth in range(1, max_depth + 1):
-                level_key = f'level{depth}'
-                conf_key = f'level{depth}_conf_score'
-                values = refined_probability_matrix[level_key].to_numpy(dtype = float)
-
+                values = score_arrays[depth]
                 if values.size and values.max() > values.min():
-                    refined_conf[conf_key] = np.clip(
-                        (refined_conf[conf_key] - values.min())
+                    key = f'level{depth}_conf_score'
+                    refined_conf[key] = np.clip(
+                        (refined_conf[key] - values.min())
                         / (values.max() - values.min()),
                         0.0,
                         1.0
@@ -1143,7 +1080,7 @@ class HierClassifier():
             if hasattr(_bridge, attr):
                 setattr(self, attr, getattr(_bridge, attr))
 
-    def celltype(self, reshape_lcpn: bool = True) -> HierAnnotationResult:
+    def celltype(self, reshape_lcpn: bool = True, all_probs: bool = False) -> HierAnnotationResult:
         """
         Run hierarchical celltyping jobs to predict cell types of input data.
 
@@ -1152,6 +1089,9 @@ class HierClassifier():
         reshape_lcpn
             Whether to reshape a node-based LCPN result into a level-based LCL-like result. Only for developer use.
             (Default: `True`)
+        all_probs
+            Whether to predict probabilities for all LCPN nodes on all query cells.
+            (Default: ``False``)
 
         Returns
         ----------
@@ -1262,7 +1202,103 @@ class HierClassifier():
                     prob_mats[node.original_name] = pd.DataFrame(1, index = cell_index, columns = [valid_child.original_name])
                     _predict_node(valid_child, cell_index)
             _predict_node(self.model.tree.root, self.indata_names)
+            if all_probs:
+                full_node_probs = {}
+
+                def _predict_full_nodes(node):
+                    children = [child for child in node.children if child.size > 0]
+                    if not children:
+                        return
+
+                    if node.model:
+                        model = self.model.model_mapping[node.model]
+                        overlap_idx = np.where(np.isin(self.indata_genes, model.classifier.features))[0]
+                        level_idx = pd.Index(model.classifier.features).get_indexer(self.indata_genes[overlap_idx])
+                        X = _memory_scale(
+                            self.indata[:, overlap_idx],
+                            model.scaler.mean_[level_idx] if model.scaler.with_mean else None,
+                            model.scaler.scale_[level_idx],
+                        )
+
+                        ni, fs, cf = model.classifier.n_features_in_, model.classifier.features, model.classifier.coef_
+                        try:
+                            model.classifier.n_features_in_ = len(level_idx)
+                            model.classifier.features = model.classifier.features[level_idx]
+                            model.classifier.coef_ = model.classifier.coef_[:, level_idx]
+                            _, prob_mat, _ = model.predict_labels_and_prob(X, mode = 'best match')
+                        finally:
+                            model.classifier.n_features_in_, model.classifier.features, model.classifier.coef_ = ni, fs, cf
+
+                        full_node_probs[node.original_name] = pd.DataFrame(
+                            prob_mat,
+                            index = self.indata_names,
+                            columns = model.classifier.classes_,
+                        )
+                    elif len(children) == 1:
+                        full_node_probs[node.original_name] = pd.DataFrame(
+                            1.0,
+                            index = self.indata_names,
+                            columns = [children[0].original_name],
+                        )
+                    else:
+                        raise ValueError(
+                            f"🛑 Node '{node.original_name}' has multiple children but no classifier"
+                        )
+
+                    for child in children:
+                        _predict_full_nodes(child)
+
+                _predict_full_nodes(self.model.tree.root)
+                # 依据所有有效叶节点生成各层标签列表，包括浅层叶节点的重复标签。
+                tree = self.model.tree
+                leaves = [
+                    node.original_name
+                    for node in tree.iter_nodes(leaf_only = True)
+                    if node.size > 0
+                ]
+                multilevel_labels = tree.get_multilevel_anno(leaves)
+                level_labels = {
+                    depth: pd.unique(multilevel_labels.iloc[:, depth - 1]).tolist()
+                    for depth in range(1, tree.depth + 1)
+                }
+
+                # level1 的根节点概率为 1；后续各列填入父节点分类器输出的原始概率。
+                full_prob_matrix = {
+                    'level1': pd.DataFrame(
+                        1.0,
+                        index = self.indata_names,
+                        columns = [tree.root.original_name],
+                    )
+                }
+
+                for depth in range(2, tree.depth + 1):
+                    level_matrix = pd.DataFrame(index = self.indata_names)
+                    for label in level_labels[depth]:
+                        path = tree.extract_path(label, print_path = False)
+
+                        # 叶节点到最大深度的重复标签代表确定性延伸，局部概率为 1。
+                        if depth > len(path):
+                            level_matrix[label] = 1.0
+                        else:
+                            parent = path[-2].original_name
+                            if label not in full_node_probs[parent].columns:
+                                raise ValueError(
+                                    f"🛑 Label '{label}' is missing from the classifier for '{parent}'"
+                                )
+                            level_matrix[label] = full_node_probs[parent][label]
+
+                    full_prob_matrix[f'level{depth}'] = level_matrix[level_labels[depth]]
             for col in labels.columns:
                 labels[col] = labels[col].astype("category")
         logger.info("✅ Prediction done!")
-        return HierAnnotationResult(labels, decision_mats, prob_mats, self.adata, self.model.tree, reshape_lcpn = reshape_lcpn)
+        result = HierAnnotationResult(
+            labels,
+            decision_mats,
+            prob_mats,
+            self.adata,
+            self.model.tree,
+            reshape_lcpn = reshape_lcpn,
+        )
+        if all_probs and self.model.mode == 'LCPN':
+            result.full_prob_matrix = full_prob_matrix
+        return result
